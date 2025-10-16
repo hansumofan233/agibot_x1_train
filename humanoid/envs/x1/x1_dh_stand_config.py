@@ -47,7 +47,7 @@ class X1DHStandCfg(LeggedRobotCfg):
         single_linvel_index = 53
         num_privileged_obs = int(c_frame_stack * single_num_privileged_obs)
         num_actions = 12
-        num_envs = 4096
+        num_envs = 1900
         episode_length_s = 24 #episode length in seconds
         use_ref_actions = False
         num_commands = 5 # sin_pos cos_pos vx vy vz
@@ -75,9 +75,9 @@ class X1DHStandCfg(LeggedRobotCfg):
         fix_base_link = False
 
     class terrain(LeggedRobotCfg.terrain):
-        # mesh_type = 'plane'
-        mesh_type = 'trimesh'
-        curriculum = False
+        mesh_type = 'plane'
+        # mesh_type = 'trimesh'
+        curriculum = True
         # rough terrain only:
         measure_heights = False
         static_friction = 0.6
@@ -88,15 +88,15 @@ class X1DHStandCfg(LeggedRobotCfg):
         num_cols = 20  # number of terrain cols (types)
         max_init_terrain_level = 5  # starting curriculum state
         platform = 3.
-        terrain_dict = {"flat": 0.3, 
-                        "rough flat": 0.2,
-                        "slope up": 0.2,
-                        "slope down": 0.2, 
+        terrain_dict = {"flat": 1.0, 
+                        "rough flat": 0.0,
+                        "slope up": 0.0,
+                        "slope down": 0.0, 
                         "rough slope up": 0.0,
                         "rough slope down": 0.0, 
-                        "stairs up": 0., 
-                        "stairs down": 0.,
-                        "discrete": 0.1, 
+                        "stairs up": 0.0, 
+                        "stairs down": 0.0,
+                        "discrete": 0.0, 
                         "wave": 0.0,}
         terrain_proportions = list(terrain_dict.values())
 
@@ -282,12 +282,13 @@ class X1DHStandCfg(LeggedRobotCfg):
         # Vers: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
         num_commands = 4
         resampling_time = 25.  # time before command are changed[s]
-        gait = ["walk_omnidirectional","stand","walk_omnidirectional"] # gait type during training
+        # gait = ["walk_omnidirectional","stand","walk_omnidirectional"] # gait type during training
+        gait = ["stand"] # gait type during training
         # proportion during whole life time
         gait_time_range = {"walk_sagittal": [2,6],
                            "walk_lateral": [2,6],
                            "rotate": [2,3],
-                           "stand": [2,3],
+                           "stand": [4,6],
                            "walk_omnidirectional": [4,6]}
 
         heading_command = False  # if true: compute ang vel command from heading error
@@ -315,7 +316,7 @@ class X1DHStandCfg(LeggedRobotCfg):
         feet_to_ankle_distance = 0.041
         cycle_time = 0.7
         # if true negative total rewards are clipped at zero (avoids early termination problems)
-        only_positive_rewards = True
+        only_positive_rewards = False
         # tracking reward = exp(-error*sigma)
         tracking_sigma = 5 
         max_contact_force = 700  # forces above this value are penalized
@@ -341,7 +342,7 @@ class X1DHStandCfg(LeggedRobotCfg):
             default_joint_pos = 1.0
             orientation = 1.
             feet_rotation = 0.3
-            base_height = 0.2
+            base_height = 0.5
             base_acc = 0.2
             # energy
             action_smoothness = -0.002
@@ -399,8 +400,8 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
     class runner:
         policy_class_name = 'ActorCriticDH'
         algorithm_class_name = 'DHPPO'
-        num_steps_per_env = 24  # per iteration
-        max_iterations = 20000  # number of policy updates
+        num_steps_per_env = 24   # per iteration
+        max_iterations = 5000  # number of policy updates
 
         # logging
         save_interval = 100  # check for potential saves every this many iterations
