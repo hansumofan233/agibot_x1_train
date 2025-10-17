@@ -386,7 +386,7 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
         in_channels = X1DHStandCfg.env.frame_stack
 
     class algorithm(LeggedRobotCfgPPO.algorithm):
-        entropy_coef = 0.001
+        entropy_coef = 0.005
         learning_rate = 1e-5
         num_learning_epochs = 2
         gamma = 0.994
