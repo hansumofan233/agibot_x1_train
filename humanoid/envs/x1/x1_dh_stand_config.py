@@ -283,12 +283,13 @@ class X1DHStandCfg(LeggedRobotCfg):
         num_commands = 4
         resampling_time = 25.  # time before command are changed[s]
         # gait = ["walk_omnidirectional","stand","walk_omnidirectional"] # gait type during training
-        gait = ["stand"] # gait type during training
+        # gait = ["stand"] # gait type during training
+        gait = ["walk_sagittal","stand"] # gait type during training
         # proportion during whole life time
         gait_time_range = {"walk_sagittal": [2,6],
                            "walk_lateral": [2,6],
                            "rotate": [2,3],
-                           "stand": [4,6],
+                           "stand": [2,3],
                            "walk_omnidirectional": [4,6]}
 
         heading_command = False  # if true: compute ang vel command from heading error
@@ -333,8 +334,8 @@ class X1DHStandCfg(LeggedRobotCfg):
             # contact 
             feet_contact_forces = -0.01
             # vel tracking
-            tracking_lin_vel = 1.8
-            tracking_ang_vel = 1.1
+            tracking_lin_vel = 2.2
+            tracking_ang_vel = 1.2
             vel_mismatch_exp = 0.5  # lin_z; ang x,y
             low_speed = 0.2
             track_vel_hard = 0.5
@@ -401,14 +402,14 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
         policy_class_name = 'ActorCriticDH'
         algorithm_class_name = 'DHPPO'
         num_steps_per_env = 24   # per iteration
-        max_iterations = 5000  # number of policy updates
+        max_iterations = 20000  # number of policy updates
 
         # logging
         save_interval = 100  # check for potential saves every this many iterations
         experiment_name = 'x1_dh_stand'
         run_name = ''
         # load and resume
-        resume = False
+        resume = True
         load_run = -1  # -1 = last run
         checkpoint = -1  # -1 = last saved model
         resume_path = None  # updated from load_run and chkpt
