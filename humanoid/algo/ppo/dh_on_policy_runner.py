@@ -305,6 +305,39 @@ class DHOnPolicyRunner:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             self.alg.state_estimator_optimizer.load_state_dict(loaded_dict["es_optimizer_state_dict"])
         self.current_learning_iteration = loaded_dict["iter"]
+
+        print("=====================================复训重置 log_std =====================================")
+        # ==== 复训时重置 log_std ====
+        def _get(key, default=None):
+            # 兼容类,实例,dict
+            if isinstance(self.policy_cfg, dict):
+                return self.policy_cfg.get(key, default)
+            else:
+                return getattr(self.policy_cfg, key, default)
+
+        is_resume_flag = self.cfg.get("resume", False)
+        if is_resume_flag and _get("reset_std_on_resume", False):
+            target_std = float(_get("reset_std_value", 0.3))
+            with torch.no_grad():
+                self.alg.actor_critic.std.copy_(
+                    torch.ones_like(self.alg.actor_critic.std) * target_std
+                )
+
+            # 重置优化器中std参数的状态，清除动量影响
+            if load_optimizer and self.alg.optimizer is not None:
+                std_param = self.alg.actor_critic.std
+                # 查找std参数在优化器状态中的对应项
+                for param_group in self.alg.optimizer.param_groups:
+                    if std_param in param_group['params']:
+                        # 清除该参数的优化器状态（动量等）
+                        if std_param in self.alg.optimizer.state:
+                            del self.alg.optimizer.state[std_param]
+                            print(f"[INFO] Optimizer state for std parameter has been reset.")
+                        break
+
+            print(f"[INFO] log_std reset to std={target_std} for retraining exploration boost.")
+        # ============================
+
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
