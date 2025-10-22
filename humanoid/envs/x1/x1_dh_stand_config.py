@@ -75,8 +75,8 @@ class X1DHStandCfg(LeggedRobotCfg):
         fix_base_link = False
 
     class terrain(LeggedRobotCfg.terrain):
-        mesh_type = 'plane'
-        # mesh_type = 'trimesh'
+        # mesh_type = 'plane'
+        mesh_type = 'trimesh'
         curriculum = True
         # curriculum = False
         # rough terrain only:
@@ -401,7 +401,7 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
         in_channels = X1DHStandCfg.env.frame_stack
 
     class algorithm(LeggedRobotCfgPPO.algorithm):
-        entropy_coef = 0.005
+        entropy_coef = 0.003
         learning_rate = 1e-5
         num_learning_epochs = 2
         gamma = 0.994
