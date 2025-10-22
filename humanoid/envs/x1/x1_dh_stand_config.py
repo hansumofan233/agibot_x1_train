@@ -339,8 +339,8 @@ class X1DHStandCfg(LeggedRobotCfg):
             feet_clearance = 1.
             feet_contact_number = 2.0
             # gait
-            feet_air_time = 2.0
-            foot_slip = -0.1
+            feet_air_time = 3.0
+            foot_slip = -1.0
             feet_distance = 0.2
             knee_distance = 0.2
             # contact 
