@@ -296,7 +296,8 @@ class X1DHStandCfg(LeggedRobotCfg):
         resampling_time = 25.  # time before command are changed[s]
         # gait = ["walk_omnidirectional","stand","walk_omnidirectional"] # gait type during training
         # gait = ["stand"] # gait type during training
-        gait = ["walk_sagittal","stand"] # gait type during training
+        # gait = ["walk_sagittal","stand"] # gait type during training
+        gait = ["walk_sagittal","stand","walk_omnidirectional"] # gait type during training
         # proportion during whole life time
         gait_time_range = {"walk_sagittal": [2,6],
                            "walk_lateral": [2,6],
@@ -401,7 +402,7 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
         in_channels = X1DHStandCfg.env.frame_stack
 
     class algorithm(LeggedRobotCfgPPO.algorithm):
-        entropy_coef = 0.003
+        entropy_coef = 0.002
         learning_rate = 1e-5
         num_learning_epochs = 2
         gamma = 0.994
