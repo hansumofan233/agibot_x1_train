@@ -354,8 +354,8 @@ class X1DHStandCfg(LeggedRobotCfg):
             track_vel_hard = 0.5
             # base pos
             default_joint_pos = 1.0
-            orientation = 1.
-            feet_rotation = 0.3
+            orientation = 2.0
+            feet_rotation = 0.5
             base_height = 0.5
             base_acc = 0.2
             # energy
