@@ -389,7 +389,7 @@ class X1DHStandEnv(LeggedRobot):
             contact_mask,  # 2
         ), dim=-1)
         
-        # random add dof_pos and dof_vel same lag
+        # random add dof_pos and dof_vel same lag 延迟模拟
         if self.cfg.domain_rand.add_dof_lag:
             if self.cfg.domain_rand.randomize_dof_lag_timesteps_perstep:
                 self.dof_lag_timestep = torch.randint(self.cfg.domain_rand.dof_lag_timesteps_range[0], 
@@ -421,7 +421,7 @@ class X1DHStandEnv(LeggedRobot):
             self.lagged_dof_pos = self.dof_pos
             self.lagged_dof_vel = self.dof_vel
 
-        # imu lag, including rpy and omega
+        # imu lag, including rpy and omega   imu传感器延迟
         if self.cfg.domain_rand.add_imu_lag:    
             if self.cfg.domain_rand.randomize_imu_lag_timesteps_perstep:
                 self.imu_lag_timestep = torch.randint(self.cfg.domain_rand.imu_lag_timesteps_range[0], 
@@ -437,11 +437,11 @@ class X1DHStandEnv(LeggedRobot):
             self.lagged_base_ang_vel = self.base_ang_vel[:,:3]
             self.lagged_base_euler_xyz = self.base_euler_xyz[:,-3:]
         
-        # obs q and dq
+        # obs q and dq      构建观测，标准化数据
         q = (self.lagged_dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos
         dq = self.lagged_dof_vel * self.obs_scales.dof_vel  
 
-        # 47
+        # 47   组合策略观测
         obs_buf = torch.cat((
             self.command_input,  # 5 = 2D(sin cos) + 3D(vel_x, vel_y, aug_vel_yaw)
             q,    # 12
@@ -451,11 +451,11 @@ class X1DHStandEnv(LeggedRobot):
             self.lagged_base_euler_xyz * self.obs_scales.quat,  # 3
         ), dim=-1)
 
-        if self.cfg.env.num_single_obs == 48:
+        if self.cfg.env.num_single_obs == 48:            #站立扩展检测
             stand_command = (torch.norm(self.commands[:, :3], dim=1, keepdim=True) <= self.cfg.commands.stand_com_threshold)
             obs_buf = torch.cat((obs_buf, stand_command),dim=1)
             
-        if self.cfg.terrain.measure_heights:
+        if self.cfg.terrain.measure_heights:         #地形感知特权观测
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
             privileged_obs_buf = torch.cat((privileged_obs_buf.clone(), heights), dim=-1)
         
