@@ -117,6 +117,11 @@ class LeggedRobot(BaseTask):
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
         # step physics and render each frame
+
+         # 提取受控关节的位置和速度数据
+        self.controlled_dof_pos = torch.index_select(self.dof_pos, 1, self.controlled_dof_indices)
+        self.controlled_dof_vel = torch.index_select(self.dof_vel, 1, self.controlled_dof_indices)
+
         self.render()
         for _ in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions).view(self.torques.shape)
@@ -887,14 +892,19 @@ class LeggedRobot(BaseTask):
             self.height_points = self._init_height_points()
         self.measured_heights = 0
 
-        # joint positions offsets and PD gains
+        # 将关节初始化逻辑提取为可重写的方法
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
-        for i in range(self.num_dofs):
+        for i in range(self.num_dof):
             name = self.dof_names[i]
-            self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
+            # self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
+            # 这里需要处理 default_joint_angles 可能不包含所有关节的情况
+            if name in self.cfg.init_state.default_joint_angles:
+                self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
+            else:
+                self.default_dof_pos[i] = 0.0  # 默认值               
             found = False
-            for dof_name in self.cfg.control.stiffness.keys():
 
+            for dof_name in self.cfg.control.stiffness.keys():
                 if dof_name in name:
                     self.p_gains[i] = self.cfg.control.stiffness[dof_name]
                     self.d_gains[i] = self.cfg.control.damping[dof_name]
@@ -904,7 +914,9 @@ class LeggedRobot(BaseTask):
                 self.d_gains[i] = 0.
                 if self.cfg.control.control_type in ["P", "V"]:
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
-        
+                    
+        self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        self.default_joint_pd_target = self.default_dof_pos.clone()
 
         self.rand_push_force = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
         self.rand_push_torque = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)

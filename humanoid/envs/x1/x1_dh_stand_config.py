@@ -41,12 +41,12 @@ class X1DHStandCfg(LeggedRobotCfg):
         frame_stack = 66      #all histroy obs num
         short_frame_stack = 5   #short history step
         c_frame_stack = 3  #all histroy privileged obs num
-        num_single_obs = 47
+        num_single_obs = 53
         num_observations = int(frame_stack * num_single_obs)
-        single_num_privileged_obs = 73
-        single_linvel_index = 53
+        single_num_privileged_obs = 81
+        single_linvel_index = 61
         num_privileged_obs = int(c_frame_stack * single_num_privileged_obs)
-        num_actions = 12
+        num_actions = 14
         num_envs = 1900
         episode_length_s = 24 #episode length in seconds
         use_ref_actions = False
@@ -135,6 +135,10 @@ class X1DHStandCfg(LeggedRobotCfg):
 
     class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 0.0, 0.7]
+        rot = [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
+        lin_vel = [0.0, 0.0, 0.0]  # x,y,z [m/s]
+        ang_vel = [0.0, 0.0, 0.0]  # x,y,z [rad/s]
+
 
         default_joint_angles = {  # = target angles [rad] when action = 0.0
             'left_hip_pitch_joint': 0.4,
@@ -143,23 +147,77 @@ class X1DHStandCfg(LeggedRobotCfg):
             'left_knee_pitch_joint': 0.49,
             'left_ankle_pitch_joint': -0.21,
             'left_ankle_roll_joint': 0.0,
+            'left_shoulder_pitch_joint': 0.15,
+
             'right_hip_pitch_joint': -0.4,
             'right_hip_roll_joint': -0.05,
             'right_hip_yaw_joint': 0.31,
             'right_knee_pitch_joint': 0.49,
             'right_ankle_pitch_joint': -0.21, 
             'right_ankle_roll_joint': 0.0,
+            'right_shoulder_pitch_joint': -0.15,
+
         }
+
+        fixed_joint_angles = {
+        'left_shoulder_roll_joint': 0.0,
+        'left_elbow_pitch_joint': 0.0,
+        'right_shoulder_roll_joint': 0.0,
+        'right_elbow_pitch_joint': 0.0,
+    }
 
     class control(LeggedRobotCfg.control):
         # PD Drive parameters:
         control_type = 'P'
 
-        stiffness = {'hip_pitch_joint': 30, 'hip_roll_joint': 40,'hip_yaw_joint': 35,
-                     'knee_pitch_joint': 100, 'ankle_pitch_joint': 35, 'ankle_roll_joint': 35}
-        damping = {'hip_pitch_joint': 3, 'hip_roll_joint': 3.0,'hip_yaw_joint': 4, 
-                   'knee_pitch_joint': 10, 'ankle_pitch_joint': 0.5, 'ankle_roll_joint': 0.5}
-
+        stiffness = {
+            # 左侧关节
+            'left_hip_pitch_joint': 30, 
+            'left_hip_roll_joint': 40, 
+            'left_hip_yaw_joint': 35, 
+            'left_knee_pitch_joint': 100, 
+            'left_ankle_pitch_joint': 35, 
+            'left_ankle_roll_joint': 35,
+            'left_shoulder_pitch_joint': 20,
+            'left_shoulder_roll_joint': 300,  # 固定关节，高刚度
+            'left_elbow_pitch_joint': 300,   # 固定关节，高刚度
+        
+            # 右侧关节
+            'right_hip_pitch_joint': 30, 
+            'right_hip_roll_joint': 40, 
+            'right_hip_yaw_joint': 35, 
+            'right_knee_pitch_joint': 100, 
+            'right_ankle_pitch_joint': 35, 
+            'right_ankle_roll_joint': 35,
+            'right_shoulder_pitch_joint': 20,
+            'right_shoulder_roll_joint': 300,  # 固定关节，高刚度
+            'right_elbow_pitch_joint': 300,    # 固定关节，高刚度
+        }
+    
+        # 真机测试时的阻尼系数 [6,3,3,4,2,2,3]
+        damping = {
+            # 左侧关节
+            'left_hip_pitch_joint': 3, 
+            'left_hip_roll_joint': 3.0, 
+            'left_hip_yaw_joint': 4, 
+            'left_knee_pitch_joint': 10, 
+            'left_ankle_pitch_joint': 0.5, 
+            'left_ankle_roll_joint': 0.5,
+            'left_shoulder_pitch_joint': 2.0,
+            'left_shoulder_roll_joint': 10.0,  # 固定关节，高阻尼
+            'left_elbow_pitch_joint': 10.0,   # 固定关节，高阻尼
+        
+            # 右侧关节
+            'right_hip_pitch_joint': 3, 
+            'right_hip_roll_joint': 3.0, 
+            'right_hip_yaw_joint': 4, 
+            'right_knee_pitch_joint': 10, 
+            'right_ankle_pitch_joint': 0.5, 
+            'right_ankle_roll_joint': 0.5,
+            'right_shoulder_pitch_joint': 2.0,
+            'right_shoulder_roll_joint': 10.0,  # 固定关节，高阻尼
+            'right_elbow_pitch_joint': 10.0,    # 固定关节，高阻尼
+        }
         # action scale: target angle = actionScale * action + defaultAngle
         action_scale = 0.5
         # decimation: Number of control action updates @ sim DT per policy DT
@@ -324,7 +382,8 @@ class X1DHStandCfg(LeggedRobotCfg):
         foot_max_dist = 1.0
 
         # final_swing_joint_pos = final_swing_joint_delta_pos + default_pos
-        final_swing_joint_delta_pos = [0.25, 0.05, -0.11, 0.35, -0.16, 0.0, -0.25, -0.05, 0.11, 0.35, -0.16, 0.0]
+        final_swing_joint_delta_pos = [0.25, 0.05, -0.11, 0.35, -0.16, 0.0,
+                                      -0.25, -0.05, 0.11, 0.35, -0.16, 0.0]
         target_feet_height = 0.03 
         target_feet_height_max = 0.06
         feet_to_ankle_distance = 0.041
@@ -369,6 +428,7 @@ class X1DHStandCfg(LeggedRobotCfg):
             dof_vel_limits = -1
             dof_pos_limits = -10.
             dof_torque_limits = -0.1
+            arm_swing_naturalness = 0.5  # 手臂自然摆动奖励系数
 
     class normalization:
         class obs_scales:

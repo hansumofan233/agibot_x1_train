@@ -111,11 +111,108 @@ class X1DHStandEnv(LeggedRobot):
         reset_idx(env_ids): Resets the environment for the specified environment IDs.
     '''
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
+        self.fixed_joint_angles = cfg.init_state.fixed_joint_angles
+        # self.fixed_joint_angles = cfg.init_state.get_fixed_joint_angles()
+        # self.last_feet_z = self.cfg.rewards.feet_to_ankle_distance
+        # self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
+        # self.ref_dof_pos = torch.zeros((self.num_envs, self.num_actions), device=self.device)      
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-        self.last_feet_z = self.cfg.rewards.feet_to_ankle_distance
-        self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
-        self.ref_dof_pos = torch.zeros((self.num_envs, self.num_actions), device=self.device)      
 
+
+    def _init_buffers(self):
+        """ Initialize torch tensors which will contain simulation states and processed quantities
+        """
+        print("=== 索引创建检查 ===")
+        print(f"所有DOF名称: {self.dof_names}")
+        fixed_joint_names = list(self.fixed_joint_angles.keys())
+        print("固定关节配置:", fixed_joint_names)
+        print(f"受控关节配置: {list(self.cfg.init_state.default_joint_angles.keys())}")
+        
+        # 1. 提取受控关节名称
+        controlled_joint_names = [
+        name for name in self.cfg.init_state.default_joint_angles.keys() 
+        if name not in fixed_joint_names  # 只添加这个条件
+        ]
+    
+        # 2. 获取受控关节索引
+        self.controlled_dof_indices = [
+            self.dof_names.index(name) for name in controlled_joint_names
+        ] 
+        # 3. 将索引列表转换为PyTorch张量,以便在GPU上高效使用
+        
+        self.fixed_dof_indices = [
+            self.dof_names.index(name) for name in self.fixed_joint_angles
+        ]
+        
+        # log_p("controlled_joint_names:", controlled_joint_names)
+        # log_p("controlled_dof_indices:", self.controlled_dof_indices)
+        # log_p("fixed_dof_indices:", self.fixed_dof_indices)
+        
+        
+        self.controlled_dof_indices = torch.tensor(self.controlled_dof_indices, device=self.device, 
+                                                   dtype=torch.long)
+        # 将可控制的关节索引转换为PyTorch张量
+        self.ref_action = torch.zeros(self.num_envs, self.num_dof, device=self.device)
+        # 初始化参考动作张量
+        self.fixed_dof_indices = torch.tensor(self.fixed_dof_indices, device=self.device,dtype=torch.long) 
+        # 将固定关节的索引转换为张量        
+        self.controlled_dof_pos = torch.zeros(self.num_envs, len(controlled_joint_names),  device=self.device)
+        # 初始化可控关节的位置张量
+
+        super()._init_buffers()  # 调用父类初始化方法
+
+        # 初始化步态时间、相位长度和步态起始相位
+        self.gait_time = torch.zeros(self.num_envs, len(self.cfg.commands.gait) ,dtype=torch.int, device=self.device, requires_grad=False)
+        self.phase_length_buf = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long)
+        self.gait_start = torch.randint(0, 2, (self.num_envs,)).to(self.device)*0.5
+        
+        self.last_feet_z = self.cfg.rewards.feet_to_ankle_distance  # 初始化上一时刻脚部的z坐标
+        self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)  # 初始化脚部高度张量
+        self.ref_dof_pos = torch.zeros((self.num_envs, self.num_actions), device=self.device)  # 初始化参考关节位置
+        
+        self.phase = torch.zeros(self.num_envs, device=self.device)
+
+    def _init_joint_properties(self):
+        """
+        [正确实现] 重写关节属性初始化,支持固定关节和控制关节分离
+        """
+
+        # 1. 初始化完整DOF(18维)的默认位置张量
+        self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        all_joint_angles = {**self.cfg.init_state.default_joint_angles, **self.fixed_joint_angles}
+
+        # 2. 设置所有关节的默认位置和PD增益
+        for i in range(self.num_dof):
+            name = self.dof_names[i]
+            
+            # 设置默认位置
+            if name in all_joint_angles:
+                self.default_dof_pos[i] = all_joint_angles[name]
+            else:
+                self.default_dof_pos[i] = 0.0
+                print(f"警告: 关节 {name} 未在关节角度配置中找到, 设置为 0")
+            
+            # 设置PD增益
+            found = False
+            for dof_name_in_cfg in self.cfg.control.stiffness.keys():
+                if dof_name_in_cfg in name:
+                    self.p_gains[i] = self.cfg.control.stiffness[dof_name_in_cfg]
+                    self.d_gains[i] = self.cfg.control.damping[dof_name_in_cfg]
+                    found = True
+                    break
+            
+            if not found:
+                self.p_gains[i] = 0.
+                self.d_gains[i] = 0.
+                print(f"PD增益未定义: {name}")
+        
+        # 4. 创建正确的14维默认关节PD目标
+        self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        self.default_joint_pd_target = self.default_dof_pos.clone()
+        self.default_dof_pos_ctl =  torch.index_select(self.default_dof_pos, 1, self.controlled_dof_indices)
+      
 
     def _push_robots(self):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
@@ -136,7 +233,7 @@ class X1DHStandEnv(LeggedRobot):
     def  _get_phase(self):
         cycle_time = self.cfg.rewards.cycle_time
         if self.cfg.commands.sw_switch:
-            stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
+            stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold).float()
             self.phase_length_buf[stand_command] = 0 # set this as 0 for which env is standing
             # self.gait_start is rand 0 or 0.5
             phase = (self.phase_length_buf * self.dt / cycle_time + self.gait_start) * (~stand_command)
@@ -271,11 +368,36 @@ class X1DHStandEnv(LeggedRobot):
                 self.rand_push_force.zero_()
                 self.rand_push_torque.zero_()
 
+
+    def _get_arm_swing_angles(self):
+        """
+        根据步态相位计算手臂摆动角度
+        返回左右肩膀pitch关节的目标角度增量
+        """
+        
+        # 计算摆臂幅度,基于行走速度
+        speed = torch.norm(self.commands[:, :2], dim=1)
+        max_swing_amplitude = 0.4 # 最大摆臂幅度 (弧度)
+        swing_amplitude = torch.clamp(speed * 0.5, 0, max_swing_amplitude)
+        
+        stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
+        swing_amplitude[stand_command] = 0.0  # 如果是站立命令,摆臂幅度为0
+        
+        # 计算相位正弦值
+        sin_pos = torch.sin(2 * torch.pi * self.phase)
+        
+        # 手臂摆动：与腿部相位相反 (自然行走模式)
+        left_arm_swing = -sin_pos * swing_amplitude
+        right_arm_swing = sin_pos * swing_amplitude
+        
+        return torch.stack((left_arm_swing, right_arm_swing), dim=1)
+
     def compute_ref_state(self):
         phase = self._get_phase()
         sin_pos = torch.sin(2 * torch.pi * phase)
         sin_pos_l = sin_pos.clone()
         sin_pos_r = sin_pos.clone()
+        arm_swing = self._get_arm_swing_angles()
 
         self.ref_dof_pos = torch.zeros_like(self.dof_pos)
         # left swing
@@ -286,22 +408,25 @@ class X1DHStandEnv(LeggedRobot):
         self.ref_dof_pos[:, 3] = -sin_pos_l * self.cfg.rewards.final_swing_joint_delta_pos[3]
         self.ref_dof_pos[:, 4] = -sin_pos_l * self.cfg.rewards.final_swing_joint_delta_pos[4]
         self.ref_dof_pos[:, 5] = -sin_pos_l * self.cfg.rewards.final_swing_joint_delta_pos[5]
+        self.ref_dof_pos[:, 6] = arm_swing[:, 0]  # left arm swing
         # right
         sin_pos_r[sin_pos_r < 0] = 0
-        self.ref_dof_pos[:, 6] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[6]
-        self.ref_dof_pos[:, 7] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[7]
-        self.ref_dof_pos[:, 8] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[8]
-        self.ref_dof_pos[:, 9] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[9]
-        self.ref_dof_pos[:, 10] = sin_pos_r * self.cfg.rewards.final_swing_joint_delta_pos[10]
-        self.ref_dof_pos[:, 11] = sin_pos_r * self.cfg.rewards.final_swing_joint_delta_pos[11]
+        self.ref_dof_pos[:, 7] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[6]
+        self.ref_dof_pos[:, 8] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[7]
+        self.ref_dof_pos[:, 9] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[8]
+        self.ref_dof_pos[:, 10] = sin_pos_r *  self.cfg.rewards.final_swing_joint_delta_pos[9]
+        self.ref_dof_pos[:, 11] = sin_pos_r * self.cfg.rewards.final_swing_joint_delta_pos[10]
+        self.ref_dof_pos[:, 12] = sin_pos_r * self.cfg.rewards.final_swing_joint_delta_pos[11]
+        self.ref_dof_pos[:, 13] = arm_swing[:, 0]  # right arm swing
 
+        # double support phase ref pos = 0
         self.ref_dof_pos[torch.abs(sin_pos) < 0.1] = 0.
         
         # if use_ref_actions=True, action += ref_action
         self.ref_action = 2 * self.ref_dof_pos
         
         # self.ref_dof_pos set ref dof pos for swing leg, ref_dof_pos=0 for stance leg
-        self.ref_dof_pos += self.default_dof_pos
+        self.ref_dof_pos += self.default_dof_pos_ctl
 
 
     def create_sim(self):
@@ -348,8 +473,6 @@ class X1DHStandEnv(LeggedRobot):
         noise_vec[self.cfg.env.num_commands+3*self.num_actions + 3: self.cfg.env.num_commands+3*self.num_actions + 6] = noise_scales.quat * self.obs_scales.quat         # euler x,y
         return noise_vec
 
-
-
     def step(self, actions):
         if self.cfg.env.use_ref_actions:
             actions += self.ref_action
@@ -370,23 +493,23 @@ class X1DHStandEnv(LeggedRobot):
             (sin_pos, cos_pos, self.commands[:, :3] * self.commands_scale), dim=1)
         
         # critic no lag
-        diff = self.dof_pos - self.ref_dof_pos
-        # 73
+        diff = self.controlled_dof_pos - self.ref_dof_pos
+        # 73+8=81 dim privileged obs
         privileged_obs_buf = torch.cat((
-            self.command_input,  # 2 + 3
-            (self.dof_pos - self.default_joint_pd_target) * self.obs_scales.dof_pos,  # 12
-            self.dof_vel * self.obs_scales.dof_vel,  # 12
-            self.actions,  # 12
-            diff,  # 12
-            self.base_lin_vel * self.obs_scales.lin_vel,  # 3
-            self.base_ang_vel * self.obs_scales.ang_vel,  # 3
-            self.base_euler_xyz * self.obs_scales.quat,  # 3
-            self.rand_push_force[:, :2],  # 2
-            self.rand_push_torque,  # 3
-            self.env_frictions,  # 1
-            self.body_mass / 10.,  # 1 # sum of all fix link mass
-            stance_mask,  # 2
-            contact_mask,  # 2
+            self.command_input,  # 2 + 3 0-4
+            (self.controlled_dof_pos - self.default_dof_pos_ctl) * self.obs_scales.dof_pos, # 12+2 5-18
+            self.controlled_dof_vel * self.obs_scales.dof_vel,  # 12+2 19-32
+            self.actions,  # 12+2 33-46
+            diff,  # 12+2 47-60
+            self.base_lin_vel * self.obs_scales.lin_vel,  # 3 61-63
+            self.base_ang_vel * self.obs_scales.ang_vel,  # 3 64-66
+            self.base_euler_xyz * self.obs_scales.quat,  # 3 67-69
+            self.rand_push_force[:, :2],  # 2 70-71
+            self.rand_push_torque,  # 3 72-74
+            self.env_frictions,  # 1 75
+            self.body_mass / 10.,  # 1 # sum of all fix link mass 76
+            stance_mask,  # 2 77-78
+            contact_mask,  # 2 79-80
         ), dim=-1)
         
         # random add dof_pos and dof_vel same lag 延迟模拟
@@ -418,8 +541,8 @@ class X1DHStandEnv(LeggedRobot):
             self.lagged_dof_vel = self.dof_vel_lag_buffer[torch.arange(self.num_envs), :, self.dof_vel_lag_timestep.long()]
         # dof_pos and dof_vel has no lag
         else:
-            self.lagged_dof_pos = self.dof_pos
-            self.lagged_dof_vel = self.dof_vel
+            self.lagged_dof_pos = self.controlled_dof_pos
+            self.lagged_dof_vel = self.controlled_dof_vel
 
         # imu lag, including rpy and omega   imu传感器延迟
         if self.cfg.domain_rand.add_imu_lag:    
@@ -438,15 +561,15 @@ class X1DHStandEnv(LeggedRobot):
             self.lagged_base_euler_xyz = self.base_euler_xyz[:,-3:]
         
         # obs q and dq      构建观测，标准化数据
-        q = (self.lagged_dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos
+        q = (self.lagged_dof_pos - self.default_dof_pos_ctl) * self.obs_scales.dof_pos
         dq = self.lagged_dof_vel * self.obs_scales.dof_vel  
 
-        # 47   组合策略观测
+        # 47   组合策略观测+6
         obs_buf = torch.cat((
             self.command_input,  # 5 = 2D(sin cos) + 3D(vel_x, vel_y, aug_vel_yaw)
-            q,    # 12
-            dq,  # 12
-            self.actions,   # 12
+            q,    # 12+2
+            dq,  # 12+2
+            self.actions,   # 12+2
             self.lagged_base_ang_vel * self.obs_scales.ang_vel,  # 3
             self.lagged_base_euler_xyz * self.obs_scales.quat,  # 3
         ), dim=-1)
@@ -555,15 +678,6 @@ class X1DHStandEnv(LeggedRobot):
         for i in range(self.critic_history.maxlen):
             self.critic_history[i][env_ids] *= 0
         
-    
-    def _init_buffers(self):
-        """ Initialize torch tensors which will contain simulation states and processed quantities
-        """
-        super()._init_buffers()
-        self.gait_time = torch.zeros(self.num_envs, len(self.cfg.commands.gait) ,dtype=torch.int, device=self.device, requires_grad=False)
-        self.phase_length_buf = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.long)
-        self.gait_start = torch.randint(0, 2, (self.num_envs,)).to(self.device)*0.5
 
 # ================================================ Rewards ================================================== #
     def _reward_ref_joint_pos(self):
@@ -573,11 +687,24 @@ class X1DHStandEnv(LeggedRobot):
         joint_pos = self.dof_pos.clone()
         pos_target = self.ref_dof_pos.clone()
         stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
-        pos_target[stand_command] = self.default_dof_pos.clone()
+        pos_target[stand_command] = self.default_dof_pos_ctl.clone()
+
         diff = joint_pos - pos_target
-        r = torch.exp(-2 * torch.norm(diff, dim=1)) - 0.2 * torch.norm(diff, dim=1).clamp(0, 0.5)
-        r[stand_command] = 1.0
-        return r
+        # 对腿部关节和手臂关节分别处理
+        leg_indices = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # 腿部关节索引
+        leg_diff = diff[:, leg_indices]  # 腿部关节差异
+        arm_diff = diff[:, [6, 13]]  # 如果索引6和13都是手臂关节
+        
+        # 腿部关节奖励(权重更高)
+        leg_reward = torch.exp(-2 * torch.norm(leg_diff, dim=1)) - 0.2 * torch.norm(leg_diff, dim=1).clamp(0, 0.5)
+        
+        # 手臂关节奖励(权重较低)
+        arm_reward = torch.exp(-1 * torch.norm(arm_diff, dim=1)) - 0.1 * torch.norm(arm_diff, dim=1).clamp(0, 0.3)
+        
+        # 组合奖励,腿部权重0.8,手臂权重0.2
+        total_reward = 0.8 * leg_reward + 0.2 * arm_reward
+        
+        return total_reward
     
     def _reward_feet_distance(self):
         """
@@ -664,12 +791,38 @@ class X1DHStandEnv(LeggedRobot):
         Calculates the reward for keeping joint positions close to default positions, with a focus 
         on penalizing deviation in yaw and roll directions. Excludes yaw and roll from the main penalty.
         """
+        stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
+         # 计算关节位置与默认位置的差异
         joint_diff = self.dof_pos - self.default_joint_pd_target
-        left_yaw_roll = joint_diff[:, [1,2,5]]
-        right_yaw_roll = joint_diff[:, [7,8,11]]
-        yaw_roll = torch.norm(left_yaw_roll, dim=1) + torch.norm(right_yaw_roll, dim=1)
-        yaw_roll = torch.clamp(yaw_roll - 0.1, 0, 50)
-        return torch.exp(-yaw_roll * 100) - 0.01 * torch.norm(joint_diff, dim=1)
+        # 分别处理腿部和手臂关节
+        leg_indices = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # 腿部关节索引
+        leg_diff = joint_diff[:, leg_indices]  # 腿部关节差异
+        arm_diff = joint_diff[:, [6, 13]]  # 6和13是手臂关节
+        left_yaw_roll = leg_diff[:, [1,2,5]]
+        right_yaw_roll = leg_diff[:, [7,8,11]]
+
+        # 计算腿部偏航和侧倾的总体偏差
+        leg_yaw_roll = torch.norm(left_yaw_roll, dim=1) + torch.norm(right_yaw_roll, dim=1)
+        leg_yaw_roll = torch.clamp(leg_yaw_roll - 0.1, 0, 50)
+        
+        # 计算手臂偏差
+        arm_deviation = torch.norm(arm_diff, dim=1)
+        
+        # 计算奖励
+        leg_reward = torch.exp(-leg_yaw_roll * 100) - 0.01 * torch.norm(leg_diff, dim=1)
+        arm_reward = torch.exp(-arm_deviation * 20) - 0.005 * arm_deviation
+        
+        # 组合奖励
+        reward = 0.9 * leg_reward + 0.1 * arm_reward
+        
+        # --- 修改部分：仅在站立命令时应用此奖励 ---
+        # 使用 torch.where，当 stand_command 为 True 时返回计算的奖励，否则返回 0
+        final_reward = torch.where(stand_command, reward, torch.zeros_like(reward))
+        
+        return final_reward
+        # yaw_roll = torch.norm(left_yaw_roll, dim=1) + torch.norm(right_yaw_roll, dim=1)
+        # yaw_roll = torch.clamp(yaw_roll - 0.1, 0, 50)
+        # return torch.exp(-yaw_roll * 100) - 0.01 * torch.norm(joint_diff, dim=1)
 
     def _reward_base_height(self):
         """
@@ -817,14 +970,23 @@ class X1DHStandEnv(LeggedRobot):
         Penalizes the use of high torques in the robot's joints. Encourages efficient movement by minimizing
         the necessary force exerted by the motors.
         """
-        return torch.sum(torch.square(self.torques), dim=1)
+        # 分别处理腿部和手臂扭矩
+        leg_torques = self.torques[:, [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]]  # 腿部扭矩
+        arm_torques = self.torques[:, [6, 13]]  # 手臂扭矩
+        
+        # 腿部扭矩惩罚权重更高
+        leg_penalty = torch.sum(torch.square(leg_torques), dim=1)
+        arm_penalty = torch.sum(torch.square(arm_torques), dim=1) * 0.5  # 手臂扭矩惩罚权重较低
+        
+        return leg_penalty + arm_penalty
+        # return torch.sum(torch.square(self.torques), dim=1)
     
     def _reward_ankle_torques(self):
         """
         Penalizes the use of high torques in the robot's joints. Encourages efficient movement by minimizing
         the necessary force exerted by the motors.
         """
-        ankle_idx = [4,5,10,11]
+        ankle_idx = [6,7,12,13]  # 踝关节索引
         return torch.sum(torch.square(self.torques[:,ankle_idx]), dim=1)
     
     def _reward_feet_rotation(self):
@@ -864,7 +1026,15 @@ class X1DHStandEnv(LeggedRobot):
             self.last_actions - self.actions), dim=1)
         term_2 = torch.sum(torch.square(
             self.actions + self.last_last_actions - 2 * self.last_actions), dim=1)
-        term_3 = 0.05 * torch.sum(torch.abs(self.actions), dim=1)
+        
+        leg_actions = torch.abs(self.actions[:, [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]])  # 腿部动作
+        arm_actions = torch.abs(self.actions[:, [6, 13]])  # 手臂动作
+        # 计算动作绝对值的惩罚项
+        term_3_leg = 0.05 * torch.sum(leg_actions, dim=1)
+        term_3_arm = 0.02 * torch.sum(arm_actions, dim=1)  # 手臂惩罚较轻
+        term_3 = term_3_leg + term_3_arm
+
+        # term_3 = 0.05 * torch.sum(torch.abs(self.actions), dim=1)
         return term_1 + term_2 + term_3
     
     def _reward_termination(self):
@@ -874,7 +1044,7 @@ class X1DHStandEnv(LeggedRobot):
     def _reward_stand_still(self):
         # penalize motion at zero commands
         stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
-        r = torch.exp(-torch.sum(torch.square(self.dof_pos - self.default_dof_pos), dim=1))
+        r = torch.exp(-torch.sum(torch.square(self.dof_pos - self.default_dof_pos_ctl), dim=1))
         r = torch.where(stand_command, r.clone(),
                         torch.zeros_like(r))
         return r
@@ -898,3 +1068,32 @@ class X1DHStandEnv(LeggedRobot):
     def _reward_dof_torque_limits(self):
         # penalize torques too close to the limit
         return torch.sum((torch.abs(self.torques) - self.torque_limits*self.cfg.rewards.soft_torque_limit).clip(min=0.), dim=1)
+    
+    def _reward_arm_swing_naturalness(self):
+        """
+        奖励手臂自然摆动,惩罚不自然的手臂运动
+        """
+        # 获取当前手臂角度(前两个关节)
+        left_arm_pos = self.controlled_dof_pos[:, 6]   # 左肩膀pitch
+        right_arm_pos = self.controlled_dof_pos[:, 13]  # 右肩膀pitch
+        
+        # 获取参考手臂角度
+        left_arm_ref = self.ref_dof_pos[:, 6]
+        right_arm_ref = self.ref_dof_pos[:, 13]
+        
+        # 计算手臂位置与参考位置的差异
+        left_arm_error = torch.abs(left_arm_pos - left_arm_ref)
+        right_arm_error = torch.abs(right_arm_pos - right_arm_ref)
+        
+        # 计算总体手臂摆动误差
+        total_arm_error = left_arm_error + right_arm_error
+        
+        # 使用指数函数计算奖励,误差越小奖励越高
+        reward = torch.exp(-total_arm_error * 5.0)
+        
+        # 只在行走时给予奖励,站立时不考虑
+        speed = torch.norm(self.commands[:, :2], dim=1)
+        moving_mask = speed > self.cfg.commands.stand_com_threshold
+        reward = reward * moving_mask.float()
+        
+        return reward
