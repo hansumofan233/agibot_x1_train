@@ -108,6 +108,159 @@ class LeggedRobot(BaseTask):
         self._prepare_reward_function()
         self.init_done = True
 
+    def _init_buffers(self):
+        """ Initialize torch tensors which will contain simulation states and processed quantities
+        """
+        # get gym GPU state tensors
+        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
+        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
+        rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
+
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        
+        # create some wrapper tensors for different slices
+        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+        self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
+        self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
+        self.base_quat = self.root_states[:, 3:7]
+        self.base_euler_xyz = get_euler_xyz_tensor(self.base_quat)
+
+        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
+        self.rigid_state = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, self.num_bodies, 13)
+        self.feet_quat = self.rigid_state[:, self.feet_indices, 3:7]
+        self.feet_euler_xyz = get_euler_xyz_tensor(self.feet_quat)
+
+
+        # initialize some data used later on
+        self.common_step_counter = 0
+        self.extras = {}
+        self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
+        self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
+        self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
+        self.torques = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_torques = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_rigid_state = torch.zeros_like(self.rigid_state)
+        self.last_contact_forces = torch.zeros_like(self.contact_forces)
+        self.last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
+        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
+        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,)
+        self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        
+        if self.cfg.terrain.measure_heights:
+            self.height_points = self._init_height_points()
+        self.measured_heights = 0
+
+        # 将关节初始化逻辑提取为可重写的方法
+        self._init_joint_properties()
+        # 模拟随机推力和随机扭矩初始化
+        self.rand_push_force = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self.rand_push_torque = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        # 添加批次维度，使[18]变为[1,18]，便于广播运算
+        self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        # 创建关节位置副本 pd target，便于独立修改PD目标
+        self.default_joint_pd_target = self.default_dof_pos.clone()
+        # 观测历史和评论家历史初始化
+        self.obs_history = deque(maxlen=self.cfg.env.frame_stack)
+        self.critic_history = deque(maxlen=self.cfg.env.c_frame_stack)
+        for _ in range(self.cfg.env.frame_stack):
+            self.obs_history.append(torch.zeros(
+                self.num_envs, self.cfg.env.num_single_obs, dtype=torch.float, device=self.device))
+        for _ in range(self.cfg.env.c_frame_stack):
+            if self.cfg.terrain.measure_heights:
+                self.critic_history.append(torch.zeros(
+                self.num_envs, self.cfg.env.single_num_privileged_obs + self.cfg.terrain.num_height, dtype=torch.float, device=self.device))
+            else:
+                self.critic_history.append(torch.zeros(
+                self.num_envs, self.cfg.env.single_num_privileged_obs, dtype=torch.float, device=self.device))
+        
+        if self.cfg.domain_rand.add_lag:   
+            self.lag_buffer = torch.zeros(self.num_envs,self.num_dof,self.cfg.domain_rand.lag_timesteps_range[1]+1,device=self.device)
+            if self.cfg.domain_rand.randomize_lag_timesteps:
+                self.lag_timestep = torch.randint(self.cfg.domain_rand.lag_timesteps_range[0],
+                                                  self.cfg.domain_rand.lag_timesteps_range[1]+1,(self.num_envs,),device=self.device) 
+                if self.cfg.domain_rand.randomize_lag_timesteps_perstep:
+                    self.last_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.lag_timesteps_range[1]
+            else:
+                self.lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.lag_timesteps_range[1]
+
+        if self.cfg.domain_rand.add_dof_lag:
+            self.dof_lag_buffer = torch.zeros(self.num_envs,self.num_dof * 2,self.cfg.domain_rand.dof_lag_timesteps_range[1]+1,device=self.device)
+            if self.cfg.domain_rand.randomize_dof_lag_timesteps:
+                self.dof_lag_timestep = torch.randint(self.cfg.domain_rand.dof_lag_timesteps_range[0],
+                                                        self.cfg.domain_rand.dof_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
+                if self.cfg.domain_rand.randomize_dof_lag_timesteps_perstep:
+                    self.last_dof_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.dof_lag_timesteps_range[1]
+            else:
+                self.dof_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.dof_lag_timesteps_range[1]
+
+        if self.cfg.domain_rand.add_imu_lag:
+            self.imu_lag_buffer = torch.zeros(self.num_envs, 6, self.cfg.domain_rand.imu_lag_timesteps_range[1]+1,device=self.device)
+            if self.cfg.domain_rand.randomize_imu_lag_timesteps:
+                self.imu_lag_timestep = torch.randint(self.cfg.domain_rand.imu_lag_timesteps_range[0],
+                                                        self.cfg.domain_rand.imu_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
+                if self.cfg.domain_rand.randomize_imu_lag_timesteps_perstep:
+                    self.last_imu_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.imu_lag_timesteps_range[1]
+            else:
+                self.imu_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.imu_lag_timesteps_range[1]
+                
+        if self.cfg.domain_rand.add_dof_pos_vel_lag:
+            self.dof_pos_lag_buffer = torch.zeros(self.num_envs,self.num_dof,self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]+1,device=self.device)
+            self.dof_vel_lag_buffer = torch.zeros(self.num_envs,self.num_dof,self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]+1,device=self.device)
+            if self.cfg.domain_rand.randomize_dof_pos_lag_timesteps:
+                self.dof_pos_lag_timestep = torch.randint(self.cfg.domain_rand.dof_pos_lag_timesteps_range[0],
+                                                        self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
+                if self.cfg.domain_rand.randomize_dof_pos_lag_timesteps_perstep:
+                    self.last_dof_pos_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]
+            else:
+                self.dof_pos_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]
+            if self.cfg.domain_rand.randomize_dof_vel_lag_timesteps:
+                self.dof_vel_lag_timestep = torch.randint(self.cfg.domain_rand.dof_vel_lag_timesteps_range[0],
+                                                        self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
+                if self.cfg.domain_rand.randomize_dof_vel_lag_timesteps_perstep:
+                    self.last_dof_vel_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]
+            else:
+                self.dof_vel_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]
+
+    def _init_joint_properties(self):
+        """初始化关节属性，子类可以重写此方法"""
+        # joint positions offsets and PD gains
+        self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        for i in range(self.num_dof):
+            name = self.dof_names[i]
+            # 这里需要处理 default_joint_angles 可能不包含所有关节的情况
+            if name in self.cfg.init_state.default_joint_angles:
+                self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
+            else:
+                self.default_dof_pos[i] = 0.0  # 默认值
+                
+            found = False
+            for dof_name in self.cfg.control.stiffness.keys():
+                if dof_name in name:
+                    self.p_gains[i] = self.cfg.control.stiffness[dof_name]
+                    self.d_gains[i] = self.cfg.control.damping[dof_name]
+                    found = True
+            if not found:
+                self.p_gains[i] = 0.
+                self.d_gains[i] = 0.
+                if self.cfg.control.control_type in ["P", "V"]:
+                    print(f"PD gain of joint {name} were not defined, setting them to zero")
+                    
+        self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        self.default_joint_pd_target = self.default_dof_pos.clone()
+
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
 
@@ -115,7 +268,9 @@ class LeggedRobot(BaseTask):
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
         clip_actions = self.cfg.normalization.clip_actions
-        self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        actions_ctl = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        self.actions = torch.index_select(actions_ctl, 1, self.controlled_dof_indices)  # 提取受控关节的动作
+    
         # step physics and render each frame
 
          # 提取受控关节的位置和速度数据
@@ -151,6 +306,8 @@ class LeggedRobot(BaseTask):
                 self.imu_lag_buffer[:,:,0] = torch.cat((self.base_ang_vel, self.base_euler_xyz ), 1).clone()
         
         self.post_physics_step()
+        # 更新最后一次受控自由度的速度数据
+        self.last_controlled_dof_vel = torch.index_select(self.last_dof_vel, 1, self.controlled_dof_indices)
 
         # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
@@ -418,28 +575,28 @@ class LeggedRobot(BaseTask):
         # rand ouput torque
         if self.cfg.domain_rand.randomize_torque:
             motor_strength_ranges = self.cfg.domain_rand.torque_multiplier_range
-            self.torque_multi[env_ids] = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),self.num_actions), device=self.device)
+            self.torque_multi[env_ids] = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),self.num_dof), device=self.device)
 
         # rand motor position offset
         if self.cfg.domain_rand.randomize_motor_offset:
             min_offset, max_offset = self.cfg.domain_rand.motor_offset_range
-            self.motor_offsets[env_ids, :] = torch_rand_float(min_offset, max_offset, (len(env_ids),self.num_actions), device=self.device)
+            self.motor_offsets[env_ids, :] = torch_rand_float(min_offset, max_offset, (len(env_ids),self.num_dof), device=self.device)
         
         # rand kp kd gain
         if self.cfg.domain_rand.randomize_gains:
             p_gains_range = self.cfg.domain_rand.stiffness_multiplier_range
             d_gains_range = self.cfg.domain_rand.damping_multiplier_range
 
-            self.randomized_p_gains[env_ids] = torch_rand_float(p_gains_range[0], p_gains_range[1], (len(env_ids),self.num_actions), device=self.device) * self.p_gains
-            self.randomized_d_gains[env_ids] =  torch_rand_float(d_gains_range[0], d_gains_range[1], (len(env_ids),self.num_actions), device=self.device) * self.d_gains    
+            self.randomized_p_gains[env_ids] = torch_rand_float(p_gains_range[0], p_gains_range[1], (len(env_ids),self.num_dof), device=self.device) * self.p_gains
+            self.randomized_d_gains[env_ids] =  torch_rand_float(d_gains_range[0], d_gains_range[1], (len(env_ids),self.num_dof), device=self.device) * self.d_gains    
 
         # rand joint friciton on torque
         if self.cfg.domain_rand.randomize_coulomb_friction:
             joint_coulomb_range = self.cfg.domain_rand.joint_coulomb_range
             joint_viscous_range = self.cfg.domain_rand.joint_viscous_range
 
-            self.randomized_joint_coulomb[env_ids] = torch_rand_float(joint_coulomb_range[0], joint_coulomb_range[1], (len(env_ids),self.num_actions), device=self.device)
-            self.randomized_joint_viscous[env_ids] =  torch_rand_float(joint_viscous_range[0], joint_viscous_range[1], (len(env_ids),self.num_actions), device=self.device)  
+            self.randomized_joint_coulomb[env_ids] = torch_rand_float(joint_coulomb_range[0], joint_coulomb_range[1], (len(env_ids),self.num_dof), device=self.device)
+            self.randomized_joint_viscous[env_ids] =  torch_rand_float(joint_viscous_range[0], joint_viscous_range[1], (len(env_ids),self.num_dof), device=self.device)  
         
         # rand joint friction set in sim
         if self.cfg.domain_rand.randomize_joint_friction:
@@ -711,36 +868,45 @@ class LeggedRobot(BaseTask):
         """
         # pd controller
         actions_scaled = actions * self.cfg.control.action_scale
+        # --- 处理延迟 (这部分逻辑不变) ---
         if self.cfg.domain_rand.add_lag:
+            # 可视化延迟缓冲区
             self.lag_buffer[:,:,1:] = self.lag_buffer[:,:,:self.cfg.domain_rand.lag_timesteps_range[1]].clone()
             self.lag_buffer[:,:,0] = actions_scaled.clone()
+            # 动态延迟随机化
             if self.cfg.domain_rand.randomize_lag_timesteps_perstep:
+                # 为每个环境随机生成延迟步数
                 self.lag_timestep = torch.randint(self.cfg.domain_rand.lag_timesteps_range[0], 
                                                   self.cfg.domain_rand.lag_timesteps_range[1]+1,(self.num_envs,),device=self.device)
+                # 防止延迟突变过大（平滑约束）
                 cond = self.lag_timestep > self.last_lag_timestep + 1
                 self.lag_timestep[cond] = self.last_lag_timestep[cond] + 1
                 self.last_lag_timestep = self.lag_timestep.clone()
+            # 根据延迟步数从缓冲区获取延迟动作
             self.lagged_actions_scaled = self.lag_buffer[torch.arange(self.num_envs),:,self.lag_timestep.long()]
         else:
             self.lagged_actions_scaled = actions_scaled
 
         if self.cfg.domain_rand.randomize_gains:
-            p_gains = self.randomized_p_gains
+            p_gains = self.randomized_p_gains     # 随机化：每个环境使用不同的PD参数
             d_gains = self.randomized_d_gains
         else:
-            p_gains = self.p_gains
+            p_gains = self.p_gains   # 固定：所有环境使用相同的PD参数
             d_gains = self.d_gains
             
         if self.cfg.domain_rand.randomize_coulomb_friction:
-            torques = p_gains * (self.lagged_actions_scaled + self.default_dof_pos - self.dof_pos + self.motor_offsets) -\
+            # 考虑摩擦的PD控制器
+            torques = p_gains * (self.lagged_actions_scaled + self.default_joint_pd_target - self.dof_pos + self.motor_offsets) -\
             d_gains * self.dof_vel -\
             self.randomized_joint_viscous * self.dof_vel - self.randomized_joint_coulomb * torch.sign(self.dof_vel)
+            #randomized_joint_viscous：粘性摩擦系数随机化
         else: 
-            torques = p_gains * (self.lagged_actions_scaled + self.default_dof_pos - self.dof_pos + self.motor_offsets) - d_gains * self.dof_vel
+            # 无摩擦标准PD控制器
+            torques = p_gains * (self.lagged_actions_scaled + self.default_joint_pd_target - self.dof_pos + self.motor_offsets) - d_gains * self.dof_vel
 
         if self.cfg.domain_rand.randomize_torque:
             motor_strength_ranges = self.cfg.domain_rand.torque_multiplier_range
-            self.torque_multi = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (self.num_envs,self.num_actions), device=self.device)
+            self.torque_multi = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (self.num_envs,self.num_dof), device=self.device)
             torques *= self.torque_multi
             
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
@@ -837,153 +1003,7 @@ class LeggedRobot(BaseTask):
             self.command_ranges["lin_vel_x"][1] = np.clip(self.command_ranges["lin_vel_x"][1] + 0.5, 0., self.cfg.commands.max_curriculum)
 
     #----------------------------------------
-    def _init_buffers(self):
-        """ Initialize torch tensors which will contain simulation states and processed quantities
-        """
-        # get gym GPU state tensors
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
-        net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
-        rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
-
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.gym.refresh_net_contact_force_tensor(self.sim)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        
-        # create some wrapper tensors for different slices
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
-        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
-        self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
-        self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
-        self.base_quat = self.root_states[:, 3:7]
-        self.base_euler_xyz = get_euler_xyz_tensor(self.base_quat)
-
-        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
-        self.rigid_state = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, self.num_bodies, 13)
-        self.feet_quat = self.rigid_state[:, self.feet_indices, 3:7]
-        self.feet_euler_xyz = get_euler_xyz_tensor(self.feet_quat)
-
-
-        # initialize some data used later on
-        self.common_step_counter = 0
-        self.extras = {}
-        self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
-        self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
-        self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
-        self.torques = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.last_torques = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.last_rigid_state = torch.zeros_like(self.rigid_state)
-        self.last_contact_forces = torch.zeros_like(self.contact_forces)
-        self.last_dof_vel = torch.zeros_like(self.dof_vel)
-        self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
-        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
-        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,)
-        self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
-        self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
-        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
-        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
-        
-        if self.cfg.terrain.measure_heights:
-            self.height_points = self._init_height_points()
-        self.measured_heights = 0
-
-        # 将关节初始化逻辑提取为可重写的方法
-        self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
-        for i in range(self.num_dof):
-            name = self.dof_names[i]
-            # self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
-            # 这里需要处理 default_joint_angles 可能不包含所有关节的情况
-            if name in self.cfg.init_state.default_joint_angles:
-                self.default_dof_pos[i] = self.cfg.init_state.default_joint_angles[name]
-            else:
-                self.default_dof_pos[i] = 0.0  # 默认值               
-            found = False
-
-            for dof_name in self.cfg.control.stiffness.keys():
-                if dof_name in name:
-                    self.p_gains[i] = self.cfg.control.stiffness[dof_name]
-                    self.d_gains[i] = self.cfg.control.damping[dof_name]
-                    found = True
-            if not found:
-                self.p_gains[i] = 0.
-                self.d_gains[i] = 0.
-                if self.cfg.control.control_type in ["P", "V"]:
-                    print(f"PD gain of joint {name} were not defined, setting them to zero")
-                    
-        self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
-        self.default_joint_pd_target = self.default_dof_pos.clone()
-
-        self.rand_push_force = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        self.rand_push_torque = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
-
-        self.default_joint_pd_target = self.default_dof_pos.clone()
-        self.obs_history = deque(maxlen=self.cfg.env.frame_stack)
-        self.critic_history = deque(maxlen=self.cfg.env.c_frame_stack)
-        for _ in range(self.cfg.env.frame_stack):
-            self.obs_history.append(torch.zeros(
-                self.num_envs, self.cfg.env.num_single_obs, dtype=torch.float, device=self.device))
-        for _ in range(self.cfg.env.c_frame_stack):
-            if self.cfg.terrain.measure_heights:
-                self.critic_history.append(torch.zeros(
-                self.num_envs, self.cfg.env.single_num_privileged_obs + self.cfg.terrain.num_height, dtype=torch.float, device=self.device))
-            else:
-                self.critic_history.append(torch.zeros(
-                self.num_envs, self.cfg.env.single_num_privileged_obs, dtype=torch.float, device=self.device))
-        
-        if self.cfg.domain_rand.add_lag:   
-            self.lag_buffer = torch.zeros(self.num_envs,self.num_actions,self.cfg.domain_rand.lag_timesteps_range[1]+1,device=self.device)
-            if self.cfg.domain_rand.randomize_lag_timesteps:
-                self.lag_timestep = torch.randint(self.cfg.domain_rand.lag_timesteps_range[0],
-                                                  self.cfg.domain_rand.lag_timesteps_range[1]+1,(self.num_envs,),device=self.device) 
-                if self.cfg.domain_rand.randomize_lag_timesteps_perstep:
-                    self.last_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.lag_timesteps_range[1]
-            else:
-                self.lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.lag_timesteps_range[1]
-
-        if self.cfg.domain_rand.add_dof_lag:
-            self.dof_lag_buffer = torch.zeros(self.num_envs,self.num_actions * 2,self.cfg.domain_rand.dof_lag_timesteps_range[1]+1,device=self.device)
-            if self.cfg.domain_rand.randomize_dof_lag_timesteps:
-                self.dof_lag_timestep = torch.randint(self.cfg.domain_rand.dof_lag_timesteps_range[0],
-                                                        self.cfg.domain_rand.dof_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
-                if self.cfg.domain_rand.randomize_dof_lag_timesteps_perstep:
-                    self.last_dof_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.dof_lag_timesteps_range[1]
-            else:
-                self.dof_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.dof_lag_timesteps_range[1]
-
-        if self.cfg.domain_rand.add_imu_lag:
-            self.imu_lag_buffer = torch.zeros(self.num_envs, 6, self.cfg.domain_rand.imu_lag_timesteps_range[1]+1,device=self.device)
-            if self.cfg.domain_rand.randomize_imu_lag_timesteps:
-                self.imu_lag_timestep = torch.randint(self.cfg.domain_rand.imu_lag_timesteps_range[0],
-                                                        self.cfg.domain_rand.imu_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
-                if self.cfg.domain_rand.randomize_imu_lag_timesteps_perstep:
-                    self.last_imu_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.imu_lag_timesteps_range[1]
-            else:
-                self.imu_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.imu_lag_timesteps_range[1]
-                
-        if self.cfg.domain_rand.add_dof_pos_vel_lag:
-            self.dof_pos_lag_buffer = torch.zeros(self.num_envs,self.num_actions,self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]+1,device=self.device)
-            self.dof_vel_lag_buffer = torch.zeros(self.num_envs,self.num_actions,self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]+1,device=self.device)
-            if self.cfg.domain_rand.randomize_dof_pos_lag_timesteps:
-                self.dof_pos_lag_timestep = torch.randint(self.cfg.domain_rand.dof_pos_lag_timesteps_range[0],
-                                                        self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
-                if self.cfg.domain_rand.randomize_dof_pos_lag_timesteps_perstep:
-                    self.last_dof_pos_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]
-            else:
-                self.dof_pos_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.dof_pos_lag_timesteps_range[1]
-            if self.cfg.domain_rand.randomize_dof_vel_lag_timesteps:
-                self.dof_vel_lag_timestep = torch.randint(self.cfg.domain_rand.dof_vel_lag_timesteps_range[0],
-                                                        self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]+1, (self.num_envs,),device=self.device)
-                if self.cfg.domain_rand.randomize_dof_vel_lag_timesteps_perstep:
-                    self.last_dof_vel_lag_timestep = torch.ones(self.num_envs,device=self.device,dtype=int) * self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]
-            else:
-                self.dof_vel_lag_timestep = torch.ones(self.num_envs,device=self.device) * self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]
-                          
+                        
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, which will be called to compute the total reward.
             Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
@@ -1128,8 +1148,8 @@ class LeggedRobot(BaseTask):
         self.base_init_state = to_torch(base_init_state_list, device=self.device, requires_grad=False)
         start_pose = gymapi.Transform()
         start_pose.p = gymapi.Vec3(*self.base_init_state[:3])
-        self.p_gains = torch.zeros(self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.d_gains = torch.zeros(self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.p_gains = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        self.d_gains = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
         self.init_randomize_props()
         
         self._get_env_origins()
@@ -1223,17 +1243,17 @@ class LeggedRobot(BaseTask):
             self.joint_armatures = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device,requires_grad=False)
             
         if self.cfg.domain_rand.randomize_torque:
-            self.torque_multi = torch.ones(self.num_envs, self.num_actions, dtype=torch.float, device=self.device,requires_grad=False)
+            self.torque_multi = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,requires_grad=False)
             
-        self.motor_offsets = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device,requires_grad=False) 
+        self.motor_offsets = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,requires_grad=False) 
             
         if self.cfg.domain_rand.randomize_gains:
-            self.randomized_p_gains = torch.zeros(self.num_envs,self.num_actions, dtype=torch.float, device=self.device, requires_grad=False) * self.p_gains
-            self.randomized_d_gains = torch.zeros(self.num_envs,self.num_actions, dtype=torch.float, device=self.device, requires_grad=False) * self.d_gains
+            self.randomized_p_gains = torch.zeros(self.num_envs,self.num_dof, dtype=torch.float, device=self.device, requires_grad=False) * self.p_gains
+            self.randomized_d_gains = torch.zeros(self.num_envs,self.num_dof, dtype=torch.float, device=self.device, requires_grad=False) * self.d_gains
             
         if self.cfg.domain_rand.randomize_coulomb_friction:
-            self.randomized_joint_coulomb = torch.zeros(self.num_envs,self.num_actions, dtype=torch.float, device=self.device, requires_grad=False) * self.p_gains
-            self.randomized_joint_viscous = torch.zeros(self.num_envs,self.num_actions, dtype=torch.float, device=self.device, requires_grad=False) * self.d_gains
+            self.randomized_joint_coulomb = torch.zeros(self.num_envs,self.num_dof, dtype=torch.float, device=self.device, requires_grad=False) * self.p_gains
+            self.randomized_joint_viscous = torch.zeros(self.num_envs,self.num_dof, dtype=torch.float, device=self.device, requires_grad=False) * self.d_gains
 
     def _get_env_origins(self):
         ''' Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
