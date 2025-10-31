@@ -151,15 +151,57 @@ def run_mujoco(policy, cfg, env_cfg):
     model.opt.timestep = cfg.sim_config.dt
     # model data
     data = mujoco.MjData(model)
-    num_actuated_joints = env_cfg.env.num_actions  # This should match the number of actuated joints in your model
-    data.qpos[-num_actuated_joints:] = cfg.robot_config.default_dof_pos
+    # 打印模型信息用于调试
+    print(f"Model info:")
+    print(f"  Total DOFs: {model.nv}")
+    print(f"  Total actuators: {model.nu}")
+    print(f"  Controlled joints: {env_cfg.env.num_actions}")
+    # 新增 - 创建正确的执行器映射
+    controlled_joint_names = list(env_cfg.init_state.default_joint_angles.keys())
+    actuator_mapping = {}
+    def normalize_name(name):
+        """标准化名称：移除前缀和后缀"""
+        # 移除 motor_ 前缀
+        if name.startswith('motor_'):
+            name = name[6:]
+        # 移除 _joint 后缀
+        if name.endswith('_joint'):
+            name = name[:-6]
+        return name
+    for joint_name in controlled_joint_names:
+        normalized_joint = normalize_name(joint_name)
+        found = False
+        
+        for i in range(model.nu):
+            actuator_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            if actuator_name:
+                normalized_actuator = normalize_name(actuator_name)
+                # 直接匹配标准化后的名称
+                if normalized_joint == normalized_actuator:
+                    actuator_mapping[joint_name] = i
+                    found = True
+                    break
+        if not found:
+            print(f"  {joint_name} -> NOT FOUND")
+    print(f"Successfully mapped {len(actuator_mapping)}/{len(controlled_joint_names)} joints")
 
+    # num_actuated_joints = env_cfg.env.num_actions  
+    # data.qpos[-num_actuated_joints:] = cfg.robot_config.default_dof_pos
+    # 重置数据：所有关节位置
+    mujoco.mj_resetData(model, data)
+    # 设置受控关节的初始位置
+    for i, joint_name in enumerate(controlled_joint_names):
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if joint_id != -1:
+            qpos_addr = model.jnt_qposadr[joint_id]
+            data.qpos[qpos_addr] = cfg.robot_config.default_dof_pos[i]
+        else:
+            print(f"Warning: Joint {joint_name} not found in model")
 
     mujoco.mj_step(model, data)
     viewer = mujoco_viewer.MujocoViewer(model, data)
     target_q = np.zeros((env_cfg.env.num_actions), dtype=np.double)
     action = np.zeros((env_cfg.env.num_actions), dtype=np.double)
-
     hist_obs = deque()
     for _ in range(env_cfg.env.frame_stack):
         hist_obs.append(np.zeros([1, env_cfg.env.num_single_obs], dtype=np.double))
@@ -168,15 +210,28 @@ def run_mujoco(policy, cfg, env_cfg):
     logger = Logger(cfg.sim_config.dt)
     
     stop_state_log = 40000
-
     np.set_printoptions(formatter={'float': '{:0.4f}'.format})
 
     for _ in range(int(cfg.sim_config.sim_duration / cfg.sim_config.dt)):
         # Obtain an observation
         q, dq, quat, v, omega, gvec, base_pos, foot_positions, foot_forces = get_obs(data,model)
-        q = q[-env_cfg.env.num_actions:]
-        dq = dq[-env_cfg.env.num_actions:]
+        # q = q[-env_cfg.env.num_actions:]
+        # dq = dq[-env_cfg.env.num_actions:]
+        # 只获取受控关节的状态
+        controlled_q = np.zeros(env_cfg.env.num_actions)
+        controlled_dq = np.zeros(env_cfg.env.num_actions)
         
+        for i, joint_name in enumerate(controlled_joint_names):
+            joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            if joint_id != -1:
+                qpos_addr = model.jnt_qposadr[joint_id]
+                qvel_addr = model.jnt_dofadr[joint_id]
+                controlled_q[i] = data.qpos[qpos_addr]
+                controlled_dq[i] = data.qvel[qvel_addr]
+        
+        q = controlled_q
+        dq = controlled_dq
+
         base_z = base_pos[2]
         foot_z = foot_positions
         foot_force_z = foot_forces
@@ -235,9 +290,28 @@ def run_mujoco(policy, cfg, env_cfg):
                         target_dq, dq, cfg.robot_config.kds, cfg)  # Calc torques
         tau = np.clip(tau, -cfg.robot_config.tau_limit, cfg.robot_config.tau_limit)  # Clamp torques
         
-        data.ctrl = tau
+        # 创建29维扭矩向量并正确映射
+        full_tau = np.zeros(model.nu, dtype=np.double)
+        for i, joint_name in enumerate(controlled_joint_names):
+            if joint_name in actuator_mapping:
+                actuator_idx = actuator_mapping[joint_name]
+                full_tau[actuator_idx] = tau[i]
+
+        data.ctrl = full_tau
         applied_tau = data.actuator_force
 
+        # 添加稳定性检查
+        if np.any(np.isnan(data.qpos)) or np.any(np.isinf(data.qpos)):
+            print("Simulation became unstable, resetting...")
+            mujoco.mj_resetData(model, data)
+            # 重新设置初始位置
+            for i, joint_name in enumerate(controlled_joint_names):
+                joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+                if joint_id != -1:
+                    qpos_addr = model.jnt_qposadr[joint_id]
+                    data.qpos[qpos_addr] = cfg.robot_config.default_dof_pos[i]
+            mujoco.mj_forward(model, data)
+            continue
         mujoco.mj_step(model, data)
         viewer.render()
 
@@ -308,12 +382,14 @@ if __name__ == '__main__':
             decimation = 10
 
         class robot_config:
-            # get PD gain
-            kps = np.array([env_cfg.control.stiffness[joint] for joint in env_cfg.control.stiffness.keys()]*2, dtype=np.double)
-            kds = np.array([env_cfg.control.damping[joint] for joint in env_cfg.control.damping.keys()]*2, dtype=np.double)
-
+            # 获取需要控制的关节名称
+            controlled_joints = list(env_cfg.init_state.default_joint_angles.keys())
+        
+            # 只获取受控关节的PD参数
+            kps = np.array([env_cfg.control.stiffness[joint] for joint in controlled_joints], dtype=np.double)
+            kds = np.array([env_cfg.control.damping[joint] for joint in controlled_joints], dtype=np.double)
+            
             tau_limit = 500. * np.ones(env_cfg.env.num_actions, dtype=np.double)  # 定义关节力矩的限制
-
             default_dof_pos = np.array(list(env_cfg.init_state.default_joint_angles.values()))
 
     # load model

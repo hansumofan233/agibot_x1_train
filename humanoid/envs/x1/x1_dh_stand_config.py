@@ -47,7 +47,7 @@ class X1DHStandCfg(LeggedRobotCfg):
         single_linvel_index = 61
         num_privileged_obs = int(c_frame_stack * single_num_privileged_obs)
         num_actions = 14
-        num_envs = 1000
+        num_envs = 1700
         episode_length_s = 24 #episode length in seconds
         use_ref_actions = False
         num_commands = 5 # sin_pos cos_pos vx vy vz
@@ -477,7 +477,7 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
         policy_class_name = 'ActorCriticDH'
         algorithm_class_name = 'DHPPO'
         num_steps_per_env = 24   # per iteration
-        max_iterations = 20000  # number of policy updates
+        max_iterations =  10000 # number of policy updates
 
         # logging
         save_interval = 100  # check for potential saves every this many iterations
