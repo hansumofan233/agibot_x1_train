@@ -47,7 +47,7 @@ class X1DHStandCfg(LeggedRobotCfg):
         single_linvel_index = 61
         num_privileged_obs = int(c_frame_stack * single_num_privileged_obs)
         num_actions = 14
-        num_envs = 1900
+        num_envs = 1000
         episode_length_s = 24 #episode length in seconds
         use_ref_actions = False
         num_commands = 5 # sin_pos cos_pos vx vy vz
@@ -484,7 +484,7 @@ class X1DHStandCfgPPO(LeggedRobotCfgPPO):
         experiment_name = 'x1_dh_stand'
         run_name = ''
         # load and resume
-        resume = True
+        resume = False
         load_run = -1  # -1 = last run
         checkpoint = -1  # -1 = last saved model
         resume_path = None  # updated from load_run and chkpt

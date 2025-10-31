@@ -575,7 +575,7 @@ class LeggedRobot(BaseTask):
         # rand ouput torque
         if self.cfg.domain_rand.randomize_torque:
             motor_strength_ranges = self.cfg.domain_rand.torque_multiplier_range
-            self.torque_multi[env_ids] = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),self.num_actions), device=self.device)
+            self.torque_multi[env_ids] = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),self.num_dof), device=self.device)
 
         # rand motor position offset
         if self.cfg.domain_rand.randomize_motor_offset:
@@ -1252,7 +1252,7 @@ class LeggedRobot(BaseTask):
             self.joint_armatures = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device,requires_grad=False)
             
         if self.cfg.domain_rand.randomize_torque:
-            self.torque_multi = torch.ones(self.num_envs, self.num_actions, dtype=torch.float, device=self.device,requires_grad=False)
+            self.torque_multi = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,requires_grad=False)
             
         self.motor_offsets = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,requires_grad=False) 
             
