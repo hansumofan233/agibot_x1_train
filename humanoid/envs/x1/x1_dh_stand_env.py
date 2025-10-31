@@ -399,7 +399,7 @@ class X1DHStandEnv(LeggedRobot):
         sin_pos_r = sin_pos.clone()
         arm_swing = self._get_arm_swing_angles()
 
-        self.ref_dof_pos = torch.zeros_like(self.dof_pos)
+        self.ref_dof_pos = torch.zeros((self.num_envs, len(self.controlled_dof_indices)), device=self.device)
         # left swing
         sin_pos_l[sin_pos_l > 0] = 0
         self.ref_dof_pos[:, 0] = -sin_pos_l * self.cfg.rewards.final_swing_joint_delta_pos[0]
@@ -710,8 +710,9 @@ class X1DHStandEnv(LeggedRobot):
         """
         Calculates the reward based on the difference between the current joint positions and the target joint positions.
         """
-        joint_pos = self.dof_pos.clone()
+        joint_pos = self.dof_pos[:, self.controlled_dof_indices].clone()
         pos_target = self.ref_dof_pos.clone()
+
         stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
         pos_target[stand_command] = self.default_dof_pos_ctl.clone()
 
@@ -818,12 +819,14 @@ class X1DHStandEnv(LeggedRobot):
         on penalizing deviation in yaw and roll directions. Excludes yaw and roll from the main penalty.
         """
         stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
-         # 计算关节位置与默认位置的差异
-        joint_diff = self.dof_pos - self.default_joint_pd_target
+        # 计算关节位置与默认位置的差异
+        default_target = self.default_joint_pd_target.squeeze()
+        joint_diff = self.dof_pos - default_target
         # 分别处理腿部和手臂关节
         leg_indices = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # 腿部关节索引
+        arm_indices = [6, 13]  # 手臂关节索引
         leg_diff = joint_diff[:, leg_indices]  # 腿部关节差异
-        arm_diff = joint_diff[:, [6, 13]]  # 6和13是手臂关节
+        arm_diff = joint_diff[:, arm_indices]  # 手臂关节差异
         left_yaw_roll = leg_diff[:, [1,2,5]]
         right_yaw_roll = leg_diff[:, [7,8,11]]
 
@@ -1070,7 +1073,9 @@ class X1DHStandEnv(LeggedRobot):
     def _reward_stand_still(self):
         # penalize motion at zero commands
         stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
-        r = torch.exp(-torch.sum(torch.square(self.dof_pos - self.default_dof_pos_ctl), dim=1))
+        controlled_dof_pos = self.dof_pos[:, self.controlled_dof_indices] 
+
+        r = torch.exp(-torch.sum(torch.square(controlled_dof_pos- self.default_dof_pos_ctl), dim=1))
         r = torch.where(stand_command, r.clone(),
                         torch.zeros_like(r))
         return r
