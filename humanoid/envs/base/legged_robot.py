@@ -187,7 +187,7 @@ class LeggedRobot(BaseTask):
                 self.num_envs, self.cfg.env.single_num_privileged_obs, dtype=torch.float, device=self.device))
         
         if self.cfg.domain_rand.add_lag:   
-            self.lag_buffer = torch.zeros(self.num_envs,self.num_dof,self.cfg.domain_rand.lag_timesteps_range[1]+1,device=self.device)
+            self.lag_buffer = torch.zeros(self.num_envs,self.num_actions,self.cfg.domain_rand.lag_timesteps_range[1]+1,device=self.device)
             if self.cfg.domain_rand.randomize_lag_timesteps:
                 self.lag_timestep = torch.randint(self.cfg.domain_rand.lag_timesteps_range[0],
                                                   self.cfg.domain_rand.lag_timesteps_range[1]+1,(self.num_envs,),device=self.device) 
@@ -575,7 +575,7 @@ class LeggedRobot(BaseTask):
         # rand ouput torque
         if self.cfg.domain_rand.randomize_torque:
             motor_strength_ranges = self.cfg.domain_rand.torque_multiplier_range
-            self.torque_multi[env_ids] = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),self.num_dof), device=self.device)
+            self.torque_multi[env_ids] = torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),self.num_actions), device=self.device)
 
         # rand motor position offset
         if self.cfg.domain_rand.randomize_motor_offset:
@@ -883,10 +883,19 @@ class LeggedRobot(BaseTask):
                 self.lag_timestep[cond] = self.last_lag_timestep[cond] + 1
                 self.last_lag_timestep = self.lag_timestep.clone()
             # 根据延迟步数从缓冲区获取延迟动作
-            self.lagged_actions_scaled = self.lag_buffer[torch.arange(self.num_envs),:,self.lag_timestep.long()]
+            self.lagged_actions_14d = self.lag_buffer[torch.arange(self.num_envs),:,self.lag_timestep.long()]
         else:
-            self.lagged_actions_scaled = actions_scaled
-
+            self.lagged_actions_14d = actions_scaled
+        # 创建18维的完整动作张量
+        self.lagged_actions_scaled = torch.zeros(self.num_envs, self.num_dof, device=self.device)
+        # 只在受控关节位置填入动作值  
+        self.lagged_actions_scaled[:, self.controlled_dof_indices] = self.lagged_actions_14d
+        if len(self.default_joint_pd_target.shape) == 3:  # [1, 1, 18]
+            default_pd_target = self.default_joint_pd_target.squeeze(0).squeeze(0)  # [18]
+            default_pd_target = default_pd_target.unsqueeze(0).expand(self.num_envs, -1)  # [1900, 18]
+        else:
+            default_pd_target = self.default_joint_pd_target
+        # --- PD控制器计算关节力矩 ---
         if self.cfg.domain_rand.randomize_gains:
             p_gains = self.randomized_p_gains     # 随机化：每个环境使用不同的PD参数
             d_gains = self.randomized_d_gains
@@ -1243,7 +1252,7 @@ class LeggedRobot(BaseTask):
             self.joint_armatures = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device,requires_grad=False)
             
         if self.cfg.domain_rand.randomize_torque:
-            self.torque_multi = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,requires_grad=False)
+            self.torque_multi = torch.ones(self.num_envs, self.num_actions, dtype=torch.float, device=self.device,requires_grad=False)
             
         self.motor_offsets = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,requires_grad=False) 
             

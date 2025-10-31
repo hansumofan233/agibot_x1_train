@@ -233,8 +233,8 @@ class X1DHStandEnv(LeggedRobot):
     def  _get_phase(self):
         cycle_time = self.cfg.rewards.cycle_time
         if self.cfg.commands.sw_switch:
-            stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold).float()
-            self.phase_length_buf[stand_command] = 0 # set this as 0 for which env is standing
+            stand_command = (torch.norm(self.commands[:, :3], dim=1) <= self.cfg.commands.stand_com_threshold)
+            self.phase_length_buf[stand_command.bool()] = 0 # set this as 0 for which env is standing
             # self.gait_start is rand 0 or 0.5
             phase = (self.phase_length_buf * self.dt / cycle_time + self.gait_start) * (~stand_command)
         else:
@@ -474,9 +474,22 @@ class X1DHStandEnv(LeggedRobot):
         return noise_vec
 
     def step(self, actions):
+        # 创建18维动作张量
+        full_actions = torch.zeros((self.num_envs, self.num_dof), device=self.device)
+        
+        # 将14维动作映射到对应位置
+        full_actions[:, self.controlled_dof_indices] = actions
+        
+        # 对固定关节设置默认角度
+        fixed_joint_positions = torch.zeros((self.num_envs, len(self.fixed_dof_indices)), device=self.device)
+        for i, joint_name in enumerate(self.fixed_joint_angles.keys()):
+            fixed_joint_positions[:, i] = self.fixed_joint_angles[joint_name]
+        full_actions[:, self.fixed_dof_indices] = fixed_joint_positions
+    
         if self.cfg.env.use_ref_actions:
-            actions += self.ref_action
-        return super().step(actions)
+            full_actions += self.ref_action  # 如果使用参考动作,将参考动作添加到输入的动作中
+        # 调用父类的step方法处理物理仿真
+        return super().step(full_actions) 
 
     def compute_observations(self):
 
@@ -520,9 +533,15 @@ class X1DHStandEnv(LeggedRobot):
                 cond = self.dof_lag_timestep > self.last_dof_lag_timestep + 1
                 self.dof_lag_timestep[cond] = self.last_dof_lag_timestep[cond] + 1
                 self.last_dof_lag_timestep = self.dof_lag_timestep.clone()
-            self.lagged_dof_pos = self.dof_lag_buffer[torch.arange(self.num_envs), :self.num_actions, self.dof_lag_timestep.long()]
-            self.lagged_dof_vel = self.dof_lag_buffer[torch.arange(self.num_envs), -self.num_actions:, self.dof_lag_timestep.long()]  
-        # random add dof_pos and dof_vel different lag
+            # 使用索引从完整状态中提取受控关节的状态
+            lagged_dof_state = self.dof_lag_buffer[torch.arange(self.num_envs), :, self.dof_lag_timestep.long()]
+            full_dof_pos = lagged_dof_state[:, :self.num_dof]
+            full_dof_vel = lagged_dof_state[:, self.num_dof:]
+            
+            # log_p(f"\nfull_dof_pos shape: {full_dof_pos.shape}, \nfull_dof_vel shape: {full_dof_vel.shape}")
+            
+            self.lagged_dof_pos = torch.index_select(full_dof_pos, 1, self.controlled_dof_indices)
+            self.lagged_dof_vel = torch.index_select(full_dof_vel, 1, self.controlled_dof_indices)        # random add dof_pos and dof_vel different lag
         elif self.cfg.domain_rand.add_dof_pos_vel_lag:
             if self.cfg.domain_rand.randomize_dof_pos_lag_timesteps_perstep:
                 self.dof_pos_lag_timestep = torch.randint(self.cfg.domain_rand.dof_pos_lag_timesteps_range[0], 
@@ -530,15 +549,22 @@ class X1DHStandEnv(LeggedRobot):
                 cond = self.dof_pos_lag_timestep > self.last_dof_pos_lag_timestep + 1
                 self.dof_pos_lag_timestep[cond] = self.last_dof_pos_lag_timestep[cond] + 1
                 self.last_dof_pos_lag_timestep = self.dof_pos_lag_timestep.clone()
-            self.lagged_dof_pos = self.dof_pos_lag_buffer[torch.arange(self.num_envs), :, self.dof_pos_lag_timestep.long()]
-                
+
+            # 从18维缓冲区读取,然后切片为14维
+            full_lagged_dof_pos = self.dof_pos_lag_buffer[torch.arange(self.num_envs), :, self.dof_pos_lag_timestep.long()]
+            self.lagged_dof_pos = torch.index_select(full_lagged_dof_pos, 1, self.controlled_dof_indices)
+              
             if self.cfg.domain_rand.randomize_dof_vel_lag_timesteps_perstep:
                 self.dof_vel_lag_timestep = torch.randint(self.cfg.domain_rand.dof_vel_lag_timesteps_range[0], 
                                                   self.cfg.domain_rand.dof_vel_lag_timesteps_range[1]+1,(self.num_envs,),device=self.device)
                 cond = self.dof_vel_lag_timestep > self.last_dof_vel_lag_timestep + 1
                 self.dof_vel_lag_timestep[cond] = self.last_dof_vel_lag_timestep[cond] + 1
                 self.last_dof_vel_lag_timestep = self.dof_vel_lag_timestep.clone()
-            self.lagged_dof_vel = self.dof_vel_lag_buffer[torch.arange(self.num_envs), :, self.dof_vel_lag_timestep.long()]
+            # 从18维缓冲区读取,然后切片为14维
+            full_lagged_dof_vel = self.dof_vel_lag_buffer[torch.arange(self.num_envs), :, self.dof_vel_lag_timestep.long()]
+            self.lagged_dof_vel = torch.index_select(full_lagged_dof_vel, 1, self.controlled_dof_indices)
+            # self.lagged_dof_vel = self.dof_vel_lag_buffer[torch.arange(self.num_envs), :, self.dof_vel_lag_timestep.long()]
+        
         # dof_pos and dof_vel has no lag
         else:
             self.lagged_dof_pos = self.controlled_dof_pos
